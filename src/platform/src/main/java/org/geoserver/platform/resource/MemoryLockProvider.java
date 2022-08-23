@@ -9,6 +9,7 @@
  */
 package org.geoserver.platform.resource;
 
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -39,10 +40,34 @@ public class MemoryLockProvider implements LockProvider {
 
     @Override
     public Resource.Lock acquire(String lockKey) {
+        return acquire(lockKey, 0l);
+    }
+
+    public Resource.Lock acquire(String lockKey, long timeoutMs) {
         final int idx = getIndex(lockKey);
         if (LOGGER.isLoggable(Level.FINE))
             LOGGER.fine("Mapped lock key " + lockKey + " to index " + idx + ". Acquiring lock.");
-        locks[idx].lock();
+
+        boolean acquire = false;
+
+        if (timeoutMs > 0) {
+            try {
+                acquire = locks[idx].tryLock(timeoutMs, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                if (LOGGER.isLoggable(Level.WARNING)) {
+                    LOGGER.log(Level.WARNING, "Waiting for lock interrupted", e);
+                    Thread.currentThread().interrupt();
+                }
+            }
+        } else {
+            locks[idx].lock();
+            acquire = true;
+        }
+
+        if (!acquire) {
+            throw new RuntimeException("Unable to acquire lock!");
+        }
+
         if (LOGGER.isLoggable(Level.FINE))
             LOGGER.fine("Mapped lock key " + lockKey + " to index " + idx + ". Lock acquired");
         return new Resource.Lock() {

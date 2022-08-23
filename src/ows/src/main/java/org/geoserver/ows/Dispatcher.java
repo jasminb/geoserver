@@ -1669,7 +1669,7 @@ public class Dispatcher extends AbstractController {
             else current = current.getCause();
         }
         if (current instanceof ClientStreamAbortedException) {
-            logger.log(Level.FINER, "Client has closed stream", t);
+            // logger.log(Level.FINER, "Client has closed stream", t);
             return;
         }
         if (isSecurityException(current)) {
@@ -1680,9 +1680,9 @@ public class Dispatcher extends AbstractController {
             HttpErrorCodeException ece = (HttpErrorCodeException) current;
             int errorCode = ece.getErrorCode();
             if (errorCode < 199 || errorCode > 299) {
-                logger.log(Level.FINE, "", t);
+                // logger.log(Level.FINE, "", t);
             } else {
-                logger.log(Level.FINER, "", t);
+                // logger.log(Level.FINER, "", t);
             }
 
             boolean isError = ece.getErrorCode() >= 400;
@@ -1712,10 +1712,10 @@ public class Dispatcher extends AbstractController {
                 }
             } catch (IOException e) {
                 // means the resposne was already commited something
-                logger.log(Level.FINER, "", t);
+                // logger.log(Level.FINER, "", t);
             }
         } else {
-            logger.log(Level.SEVERE, "", t);
+            // logger.log(Level.SEVERE, "", t);
 
             // unwind the exception stack until we find one we know about
             Throwable cause = t;

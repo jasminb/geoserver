@@ -46,7 +46,11 @@ public class CallbackInterceptor extends HandlerInterceptorAdapter {
 
         if (ex != null) {
             for (DispatcherCallback callback : callbacks) {
-                callback.exception(request, response, ex);
+                try {
+                    callback.exception(request, response, ex);
+                } catch (Exception e) {
+                    LOGGER.log(Level.SEVERE, "Failure in afterCompletion", e);
+                }
             }
         }
 

@@ -29,6 +29,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -98,7 +100,7 @@ import org.geowebcache.layer.meta.MetadataURL;
 import org.geowebcache.layer.meta.TileJSON;
 import org.geowebcache.layer.meta.VectorLayerMetadata;
 import org.geowebcache.layer.updatesource.UpdateSourceDefinition;
-import org.geowebcache.locks.LockProvider.Lock;
+import org.geowebcache.locks.LockProvider;
 import org.geowebcache.mime.FormatModifier;
 import org.geowebcache.mime.MimeException;
 import org.geowebcache.mime.MimeType;
@@ -128,6 +130,9 @@ public class GeoServerTileLayer extends TileLayer implements ProxyLayer, TileJSO
 
     public static final ThreadLocal<WebMap> WEB_MAP = new ThreadLocal<>();
     public static final ThreadLocal<Set<DimensionWarning>> DIMENSION_WARNINGS = new ThreadLocal<>();
+
+    // 10 seconds GWC tile lock timeout
+    private static final long GWC_LOCK_TIMEOUT = 10000L;
 
     private String configErrorMessage;
 
@@ -166,6 +171,10 @@ public class GeoServerTileLayer extends TileLayer implements ProxyLayer, TileJSO
     private LegendSample legendSample;
 
     private WMS wms;
+
+    private static final AtomicInteger RUNNING_REQUESTS = new AtomicInteger(0);
+    private static final AtomicInteger TOTAL_REQUESTS = new AtomicInteger(0);
+    private static final AtomicLong TOTAL_DURATION = new AtomicLong(0);
 
     public GeoServerTileLayer(
             final PublishedInfo publishedInfo,
@@ -552,7 +561,7 @@ public class GeoServerTileLayer extends TileLayer implements ProxyLayer, TileJSO
             metaX = metaY = 1;
         }
 
-        ConveyorTile returnTile = getMetatilingReponse(tile, true, metaX, metaY);
+        ConveyorTile returnTile = getMetatilingReponse(tile, true, metaX, metaY, 0L);
 
         sendTileRequestedEvent(returnTile);
 
@@ -577,18 +586,43 @@ public class GeoServerTileLayer extends TileLayer implements ProxyLayer, TileJSO
     }
 
     protected ConveyorTile getMetatilingReponse(
-            ConveyorTile tile, final boolean tryCache, final int metaX, final int metaY)
+            ConveyorTile tile,
+            final boolean tryCache,
+            final int metaX,
+            final int metaY,
+            long lockTimeout)
             throws GeoWebCacheException, IOException {
 
-        if (tryCache && tryCacheFetch(tile)) {
-            return finalizeTile(tile);
+        int totalRequests = TOTAL_REQUESTS.incrementAndGet();
+        RUNNING_REQUESTS.incrementAndGet();
+        long start = System.currentTimeMillis();
+
+        if (tryCache) {
+            boolean cacheHit = false;
+            try {
+                if (tryCacheFetch(tile)) {
+                    ConveyorTile conveyorTile = finalizeTile(tile);
+                    cacheHit = true;
+                    return conveyorTile;
+                }
+            } finally {
+                if (cacheHit) {
+                    long duration = System.currentTimeMillis() - start;
+                    int running = RUNNING_REQUESTS.decrementAndGet();
+                    long totalDuration = TOTAL_DURATION.addAndGet(duration);
+
+                    logStats(running, duration, true);
+                    logAvgStats(totalRequests, totalDuration);
+                }
+            }
         }
 
         final GeoServerMetaTile metaTile = createMetaTile(tile, metaX, metaY);
-        Lock lock = null;
+        LockProvider.Lock lock = null;
         try {
             /* ****************** Acquire lock ******************* */
-            lock = GWC.get().getLockProvider().getLock(buildLockKey(tile, metaTile));
+            lock = GWC.get().getLockProvider().getLock(buildLockKey(tile, metaTile), lockTimeout);
+
             // got the lock on the meta tile, try again
             if (tryCache && tryCacheFetch(tile)) {
                 LOGGER.finest(
@@ -623,10 +657,46 @@ public class GeoServerTileLayer extends TileLayer implements ProxyLayer, TileJSO
             if (lock != null) {
                 lock.release();
             }
+
+            long duration = System.currentTimeMillis() - start;
+            int running = RUNNING_REQUESTS.decrementAndGet();
+            long totalDuration = TOTAL_DURATION.addAndGet(duration);
+
+            logStats(running, duration, false);
+            logAvgStats(totalRequests, totalDuration);
+
             metaTile.dispose();
         }
 
         return finalizeTile(tile);
+    }
+
+    private void logAvgStats(long totalRequests, long totalDuration) {
+        if (totalRequests % 1000 == 0) {
+            long requestAvgMs = totalDuration / totalRequests;
+
+            if (LOGGER.isLoggable(Level.INFO)) {
+                LOGGER.log(
+                        Level.INFO,
+                        "GET MAP AVG STATS: total_requests="
+                                + totalRequests
+                                + ", duration_avg="
+                                + requestAvgMs);
+            }
+        }
+    }
+
+    private void logStats(long running, long duration, boolean cacheHit) {
+        if (LOGGER.isLoggable(Level.INFO)) {
+            LOGGER.log(
+                    Level.INFO,
+                    "GET MAP STATS: running_requests="
+                            + running
+                            + ", duration="
+                            + duration
+                            + ", cache_hit="
+                            + cacheHit);
+        }
     }
 
     /**
@@ -801,7 +871,7 @@ public class GeoServerTileLayer extends TileLayer implements ProxyLayer, TileJSO
     @Override
     public ConveyorTile getNoncachedTile(ConveyorTile tile) throws GeoWebCacheException {
         try {
-            return getMetatilingReponse(tile, false, 1, 1);
+            return getMetatilingReponse(tile, false, 1, 1, 0L);
         } catch (IOException e) {
             throw new GeoWebCacheException(e);
         }
@@ -810,7 +880,7 @@ public class GeoServerTileLayer extends TileLayer implements ProxyLayer, TileJSO
     @Override
     public ConveyorTile doNonMetatilingRequest(ConveyorTile tile) throws GeoWebCacheException {
         try {
-            return getMetatilingReponse(tile, true, 1, 1);
+            return getMetatilingReponse(tile, true, 1, 1, 0L);
         } catch (IOException e) {
             throw new GeoWebCacheException(e);
         }
@@ -838,7 +908,8 @@ public class GeoServerTileLayer extends TileLayer implements ProxyLayer, TileJSO
         if (!tile.getMimeType().supportsTiling()) {
             metaX = metaY = 1;
         }
-        getMetatilingReponse(tile, tryCache, metaX, metaY);
+        // Timeout the attempt to lock
+        getMetatilingReponse(tile, tryCache, metaX, metaY, GWC_LOCK_TIMEOUT);
     }
 
     /** @see org.geowebcache.layer.TileLayer#getGridSubsets() */

@@ -24,6 +24,11 @@ public class ConfigurableLockProvider implements LockProvider {
         return delegate.getLock(lockKey);
     }
 
+    @Override
+    public Lock getLock(String lockKey, long timeout) throws GeoWebCacheException {
+        return delegate.getLock(lockKey, timeout);
+    }
+
     public LockProvider getDelegate() {
         return delegate;
     }

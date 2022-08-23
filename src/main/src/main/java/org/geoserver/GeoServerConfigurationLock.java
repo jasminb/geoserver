@@ -5,11 +5,18 @@
  */
 package org.geoserver;
 
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.apache.commons.lang3.tuple.Pair;
 import org.geoserver.platform.GeoServerExtensions;
 import org.geotools.util.logging.Logging;
 
@@ -23,6 +30,11 @@ import org.geotools.util.logging.Logging;
  * {code}-DGeoServerConfigurationLock.enabled=false{code}
  *
  * @author Andrea Aime - GeoSolution
+ *     <p>In case lock is held for longer than <code>DEAD_LOCK_TRIGGER_TS</code>, lock will be
+ *     replaced with the new one as the locks held longer than configured time are considered to be
+ *     `lost`.
+ *     <p>All threads that were attempting to acquire a lock during this time will perform
+ *     reattempts using the new lock.
  */
 public class GeoServerConfigurationLock {
 
@@ -36,16 +48,25 @@ public class GeoServerConfigurationLock {
 
     private static final Logger LOGGER = Logging.getLogger(GeoServerConfigurationLock.class);
 
-    private static final ReentrantReadWriteLock readWriteLock = new ReentrantReadWriteLock(true);
+    private static volatile ReentrantReadWriteLock readWriteLock = new ReentrantReadWriteLock(true);
 
     private static final ThreadLocal<LockType> currentLock = new ThreadLocal<>();
 
-    public static enum LockType {
+    public enum LockType {
         READ,
         WRITE
     };
 
     private boolean enabled;
+
+    // Deadlock resolution variables
+    private static final Map<Thread, Pair<LockType, Long>> lockTimes = new ConcurrentHashMap<>();
+    // Any lock held for longer than a minute is considered to be lost (deadlocked), owning thread
+    // will be
+    // interrupted and new lock will be created for further use
+    private static final long DEADLOCK_TRIGGER_TS = 60000;
+    private static final AtomicLong lockCreateTs = new AtomicLong(System.currentTimeMillis());
+    private static final Object LOCK_OBJECT = new Object();
 
     public GeoServerConfigurationLock() {
         String pvalue = System.getProperty("GeoServerConfigurationLock.enabled");
@@ -67,10 +88,19 @@ public class GeoServerConfigurationLock {
             return;
         }
 
-        Lock lock = getLock(type);
+        boolean locked = tryLock(type);
 
-        lock.lock();
-        currentLock.set(type);
+        if (!locked) {
+            if (LOGGER.isLoggable(Level.SEVERE)) {
+                LOGGER.log(
+                        Level.SEVERE,
+                        "Failed to acquire lock="
+                                + type
+                                + ", thread="
+                                + Thread.currentThread().getName());
+            }
+            throw new RuntimeException("Failed to acquire lock=" + type);
+        }
 
         if (LOGGER.isLoggable(LEVEL)) {
             LOGGER.log(
@@ -109,11 +139,19 @@ public class GeoServerConfigurationLock {
             return true;
         }
 
-        Lock lock = getLock(type);
+        // Capture the creation timestamp as it will be used to detect deadlock scenario
+        final long startTs = System.currentTimeMillis();
 
-        boolean res = false;
+        boolean success = false;
+        boolean retry = false;
         try {
-            res = lock.tryLock(DEFAULT_TRY_LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            success = getLock(type).tryLock(DEFAULT_TRY_LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+
+            // In case of failure retry locking by checking for deadlocks
+            if (!success) {
+                success = tryLockReplaceAndAcquire(type);
+                retry = true;
+            }
         } catch (InterruptedException e) {
             LOGGER.log(
                     Level.WARNING,
@@ -121,15 +159,16 @@ public class GeoServerConfigurationLock {
                             + Thread.currentThread().getId()
                             + " thrown an InterruptedException on GeoServerConfigurationLock TryLock.",
                     e);
-            res = false;
         } finally {
-            if (res) {
+            // Set lock variables
+            if (success) {
                 currentLock.set(type);
+                lockTimes.put(Thread.currentThread(), Pair.of(type, System.currentTimeMillis()));
             }
         }
 
         if (LOGGER.isLoggable(LEVEL)) {
-            if (res) {
+            if (success) {
                 LOGGER.log(
                         LEVEL,
                         "Thread "
@@ -146,7 +185,117 @@ public class GeoServerConfigurationLock {
             }
         }
 
-        return res;
+        // In case of a retry success, we do not care about lock timestamp as the new timestamp was
+        // set in the retry
+        // and checking it would always yield false positive which would incur a lock retry
+        if (retry && success) {
+            return success;
+        }
+
+        // Retry the lock in case lock was changed as this lock is no longer valid
+        if (lockCreateTs.get() > startTs) {
+            if (LOGGER.isLoggable(Level.SEVERE)) {
+                LOGGER.log(
+                        Level.SEVERE,
+                        "Reacquiring the lock due to lock replacement, lock="
+                                + type
+                                + ", thread="
+                                + Thread.currentThread().getName());
+            }
+            if (success) {
+                // Unset lock variables
+                currentLock.set(null);
+                lockTimes.remove(Thread.currentThread());
+            }
+            return tryLock(type);
+        }
+
+        return success;
+    }
+
+    private boolean isPotentialDeadlock() {
+        long lockAge = System.currentTimeMillis() - lockCreateTs.get();
+        // In case lock is not old enough to deadlock, return (this can happen only in case other
+        // thread already
+        // replaced the deadlocked lock)
+        return lockAge > DEADLOCK_TRIGGER_TS;
+    }
+
+    private boolean tryLockReplaceAndAcquire(LockType lockType) {
+        // No point to check
+        if (!isPotentialDeadlock()) {
+            return false;
+        }
+
+        Map.Entry<Thread, Pair<LockType, Long>> deadlockEntry = null;
+        for (Map.Entry<Thread, Pair<LockType, Long>> acquiredLocks : lockTimes.entrySet()) {
+            long lockTs = acquiredLocks.getValue().getValue();
+            long elapsedTime = System.currentTimeMillis() - lockTs;
+
+            if (elapsedTime > DEADLOCK_TRIGGER_TS) {
+                deadlockEntry = acquiredLocks;
+                break;
+            }
+        }
+
+        // Deadlock scenario
+        if (deadlockEntry != null) {
+            synchronized (LOCK_OBJECT) {
+                // In case lock is not old enough to deadlock, return (this can happen only in case
+                // other thread already
+                // replaced the deadlocked lock)
+                if (!isPotentialDeadlock()) {
+                    return false;
+                }
+
+                // We no longer care for current locks (somewhat dangerous)
+                lockTimes.clear();
+                // Replace the lock with new one
+                ReentrantReadWriteLock newLock = new ReentrantReadWriteLock(true);
+
+                // Acquire the needed lock
+                if (lockType == LockType.READ) {
+                    newLock.readLock().lock();
+                } else {
+                    newLock.writeLock().lock();
+                }
+
+                // Make the lock available to other threads
+                readWriteLock = newLock;
+
+                // Set the time when lock was replaced
+                lockCreateTs.set(System.currentTimeMillis());
+
+                // Interrupt the lock owning thread
+                if (deadlockEntry.getKey().isAlive()) {
+                    try {
+                        deadlockEntry.getKey().interrupt();
+                    } catch (Exception e) {
+                        LOGGER.log(
+                                Level.WARNING,
+                                "Failed to interrupt stuck thread="
+                                        + deadlockEntry.getKey().getName(),
+                                e);
+                    }
+                }
+
+                if (LOGGER.isLoggable(Level.SEVERE)) {
+                    LOGGER.log(
+                            Level.SEVERE,
+                            "Caught potential deadlock, lock_owner_thread="
+                                    + deadlockEntry.getKey().getName()
+                                    + ", lock_owner_thread_state="
+                                    + deadlockEntry.getKey().getState()
+                                    + ", lock_type="
+                                    + deadlockEntry.getValue().getKey()
+                                    + ", thread="
+                                    + Thread.currentThread().getName());
+                }
+
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -190,7 +339,8 @@ public class GeoServerConfigurationLock {
         try {
             Lock lock = getLock(type);
 
-            if (LOGGER.isLoggable(LEVEL)) {
+            /*
+                        if (LOGGER.isLoggable(LEVEL)) {
                 LOGGER.log(
                         LEVEL,
                         "Thread "
@@ -198,7 +348,10 @@ public class GeoServerConfigurationLock {
                                 + " releasing the lock in mode "
                                 + type);
             }
+             */
+
             lock.unlock();
+            lockTimes.remove(Thread.currentThread());
         } finally {
             currentLock.set(null);
         }
@@ -220,15 +373,122 @@ public class GeoServerConfigurationLock {
         } else {
             lock = readWriteLock.readLock();
         }
-        if (LOGGER.isLoggable(LEVEL)) {
+        /*
+                if (LOGGER.isLoggable(LEVEL)) {
             LOGGER.log(
                     LEVEL, "Thread " + Thread.currentThread().getId() + " locking in mode " + type);
         }
+         */
         return lock;
     }
 
     /** Returns the lock type owned by the current thread (could be {@code null} for no lock) */
     public LockType getCurrentLock() {
         return currentLock.get();
+    }
+
+    public static void main(String[] args) throws Exception {
+        final AtomicBoolean writing = new AtomicBoolean(false);
+
+        GeoServerConfigurationLock lock = new GeoServerConfigurationLock();
+
+        AtomicInteger writeReqs = new AtomicInteger(0);
+        AtomicInteger readReqs = new AtomicInteger(0);
+
+        for (int i = 0; i < 5; i++) {
+            final int tid = i;
+            new Thread(
+                            new Runnable() {
+                                @Override
+                                public void run() {
+                                    Thread.currentThread().setName("R: " + tid);
+                                    while (true) {
+                                        try {
+                                            lock.lock(LockType.WRITE);
+                                            if (writing.get()) {
+                                                System.out.println(
+                                                        "FAIL FROM WRITER, THERE IS A THREAD OWNING WRITE LOCK");
+                                            }
+                                            writing.set(true);
+                                            try {
+                                                Thread.sleep(10);
+                                            } catch (Exception e) {
+                                                e.printStackTrace();
+                                            }
+
+                                            writing.set(false);
+
+                                            boolean deadlock = false;
+                                            if (tid == 0
+                                                    && ThreadLocalRandom.current().nextInt(100)
+                                                            > 98) {
+                                                try {
+                                                    deadlock = true;
+                                                    System.out.println("Simulating deadlock...");
+                                                    Thread.sleep(70000);
+                                                } catch (Exception e) {
+                                                    // e.printStackTrace();
+                                                }
+                                            }
+
+                                            if (!deadlock) {
+                                                lock.unlock();
+                                                writeReqs.incrementAndGet();
+                                            }
+
+                                        } catch (Exception e) {
+                                            // e.printStackTrace();
+                                        }
+                                    }
+                                }
+                            })
+                    .start();
+        }
+
+        for (int i = 0; i < 100; i++) {
+            new Thread(
+                            new Runnable() {
+                                @Override
+                                public void run() {
+                                    while (true) {
+                                        try {
+                                            lock.lock(LockType.READ);
+                                            if (writing.get()) {
+                                                System.out.println(
+                                                        "FAIL FROM READER, THERE IS A THREAD OWNING WRITE LOCK");
+                                            }
+                                            try {
+                                                Thread.sleep(1);
+                                            } catch (Exception e) {
+                                                e.printStackTrace();
+                                            }
+
+                                            lock.unlock();
+                                            readReqs.incrementAndGet();
+                                        } catch (Exception e) {
+                                        }
+                                    }
+                                }
+                            })
+                    .start();
+        }
+
+        int r = readReqs.get();
+        int w = writeReqs.get();
+
+        while (true) {
+            Thread.sleep(5000);
+            int newr = readReqs.get();
+            int neww = writeReqs.get();
+
+            int rd = newr - r;
+            int wd = neww - w;
+
+            System.out.println("R: " + rd);
+            System.out.println("W: " + wd);
+
+            r = newr;
+            w = neww;
+        }
     }
 }
